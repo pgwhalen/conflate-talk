@@ -1,0 +1,416 @@
+---
+title: "Breaking the rules of channels, with more channels"
+author: "Paul Whalen"
+output-dir: "presentation"
+format:
+    revealjs:
+        theme: serif
+        code-block-height: 650px
+---
+
+## The First Rule Of Channels {.center}
+
+- **Sending a message on a channel blocks the sending goroutine until the receiving goroutine is ready to receive it**
+- This means a producer goroutine will block if the consumer goroutine is slower
+
+## The Problem
+
+- A producer goroutine sends every sale as it happens
+- A consumer goroutine receives sale messages, and redraws the UI
+
+## In Code
+
+```{.go code-line-numbers="|1|3-7|9-13|15-20"}
+type Sale struct { dollars float64, timestamp time.Time }
+
+func producer(salesCh chan<- Sale) {
+	for {
+		salesCh <- makeSale() // every 500ms
+	}
+}
+
+func consumer(salesCh <-chan Sale) {
+	for s := range salesCh {
+		redrawUI(s) // takes 700ms
+	}
+}
+
+func main() {
+	salesCh := make(chan Sale)
+	go producer(salesCh)
+	go consumer(salesCh)
+	select {} // block forever
+}
+```
+
+::: {.notes}
+ - a sale can occur, for a dollar amount at a time
+ - sales are made in one goroutine every 500ms
+ - sales are sent to another goroutine where we draw the results in a UI, which takes 700ms
+ - a channel links between them
+:::
+
+## Output - what's wrong?
+
+ - Producer is slow!
+ - Consumer is slow!
+
+```{.log code-line-numbers="|4|5"}
+00.5s | Made sale: $1.00 at 00.5s
+01.0s | Made sale: $2.00 at 01.0s
+01.2s | Sale received after 0ms: $1.00 at 00.5s. Total sales: $1.00
+01.7s | Made sale: $3.00 at 01.5s
+01.9s | Sale received after 200ms: $2.00 at 01.0s. Total sales: $3.00
+```
+
+::: {.notes}
+ - producer is held up sending a sale, because the consumer is still drawing the - first
+ - consumer is backed up, the UI shows 900ms stale data even though it only takes 700ms to draw
+:::
+
+
+## Solution 0: Buffered Channel
+
+```{.go code-line-numbers="|2"}
+func main() {
+	salesCh := make(chan Sale, 3)
+	go producer(salesCh)
+	go consumer(salesCh)
+	select {}
+}
+```
+
+::: {.notes}
+ - make the channel buffered
+:::
+
+## Grading Solution 0
+
+- ✅ - The producer doesn't always block if the consumer isn't ready
+- ❌ - The consumer has to process every message and will fall behind
+- ❌ - The producer will eventually block
+
+. . .
+
+```{.log code-line-numbers="|2|3|5-6"}
+...
+03.5s | Made sale: $7.00 at 03.5s
+04.0s | Sale received after 802ms: $5.00 at 02.5s. Total sales: $15.00
+...
+15.0s | Made sale: $25.00 at 12.5s
+15.2s | Sale received after 4012ms: $21.00 at 10.5s. Total sales: $231.00
+```
+
+::: {.notes}
+ - the producer is not blocked sending a sale, initially
+ - the consumer is still lagging
+ - eventually, the producer is blocked sending a sale, and the consumer is now extremely lagged
+:::
+
+. . .
+
+**Adding a queue never improves performance!**  We're just delaying the problem.
+
+## Solution 0b: Non-blocking Send
+
+```{.go}
+func producer(salesCh chan<- Sale) {
+	for {
+		select {
+		case salesCh <- makeSale():
+		default:
+		}
+	}
+}
+```
+
+::: {.notes}
+ - non-blocking send, so the producer never blocks
+:::
+
+## Grading Solution 0b
+
+ - ✅ - The producer never blocks
+ - ❌ - The consumer doesn't see every message!
+
+. . .
+
+```{.log code-line-numbers="|1-2,4-5|3,6"}
+00.5s | Made sale: $1.00 at 00.5s
+01.0s | Made sale: $2.00 at 01.0s
+01.2s | Sale received after 0ms: $1.00 at 00.5s. Total sales: $1.00
+01.5s | Made sale: $3.00 at 01.5s
+02.0s | Made sale: $4.00 at 02.0s
+02.2s | Sale received after 2ms: $3.00 at 01.5s. Total sales: $4.00
+```
+
+::: {.notes}
+ - every sale is sent when it happens
+ - the consumer misses some messages - total sales is incorrect
+:::
+
+. . .
+ 
+What's up with our total sales number?! Non-blocking sends drop messages!
+
+## Solution 1: Goroutine in the middle
+
+```{.go code-line-numbers="|2-4|6-10|"}
+func ConflateV1[T any]() (chan<- T, <-chan T) {
+	outCh := make(chan T)
+	inCh := make(chan T)
+	go func() {
+		for {
+			lastMsg := <-inCh
+
+			select {
+			case outCh <- lastMsg:
+			default:
+			}
+		}
+	}()
+	return inCh, outCh
+}
+```
+
+. . .
+
+```{.go}
+inCh, outCh := solutions.ConflateV1[Sale]()
+go producer(inCh)
+go consumer(outCh)
+```
+
+::: {.notes}
+ - let's set up a goroutine between the producer and consumer, and make an input and output channel
+ - now we receive from the input channel, and do a non-blocking send on the output channel 
+:::
+
+## Grading Solution 1
+
+- ✅ - The producer isn't blocked sending messages (still)
+- ✅ - We've decoupled the producer from the consumer (sort of)
+- ❌ - The consumer doesn't see every message! (still)
+
+. . .
+
+```{.log}
+00.5s | Made sale: $1.00 at 00.5s
+01.0s | Made sale: $2.00 at 01.0s
+01.2s | Sale received after 1ms: $1.00 at 00.5s. Total sales: $1.00
+01.5s | Made sale: $3.00 at 01.5s
+02.0s | Made sale: $4.00 at 02.0s
+02.2s | Sale received after 3ms: $3.00 at 01.5s. Total sales: $4.00
+```
+
+. . .
+
+We've only shifted the problem into the intermediate goroutine.
+
+::: {.notes}
+ - output is nearly identical to the last one!
+:::
+
+## Solution 2: Retry until success
+
+```{.go code-line-numbers="|20-22|5-7|10,15|19"}
+func ConflateV2[T any](retryInterval time.Duration) (chan<- T, <-chan T) {
+	outCh := make(chan T)
+	inCh := make(chan T)
+	go func() {
+		var lastMsg T
+		var retryTimer *time.Timer
+		var retryCh <-chan time.Time
+		for {
+			select {
+			case lastMsg = <-inCh:
+				if retryTimer != nil {
+					retryTimer.Stop()
+					retryCh = nil
+				}
+			case <-retryCh:
+			}
+
+			select {
+			case outCh <- lastMsg:
+			default:
+				retryTimer = time.NewTimer(retryInterval)
+				retryCh = retryTimer.C
+			}
+		}
+	}()
+	return inCh, outCh
+}
+```
+
+::: {.notes}
+ - if the consumer isn't ready, setup a time to retry later
+ - keep track of the last message sent, as well as the timer
+ - the goroutine now reacts to new input messages, or when the retry timer goes off
+ - eventually we send that last message
+:::
+
+## Grading Solution 2
+
+- ✅ - We're always eventually sending the latest message
+- ✅ - The consumer sees the *latest* message sooner
+- ❌ - The consumer doesn't see every message (still)
+
+. . .
+
+```{.log code-line-numbers="|10"}
+00.5s | Made sale: $1.00 at 00.5s
+01.0s | Made sale: $2.00 at 01.0s
+01.2s | Sale received after 0ms: $1.00 at 00.5s. Total sales: $1.00
+01.5s | Made sale: $3.00 at 01.5s
+01.9s | Sale received after 201ms: $2.00 at 01.0s. Total sales: $3.00
+02.0s | Made sale: $4.00 at 02.0s
+02.5s | Made sale: $5.00 at 02.5s
+02.6s | Sale received after 402ms: $3.00 at 01.5s. Total sales: $6.00
+03.0s | Made sale: $6.00 at 03.0s
+03.3s | Sale received after 102ms: $5.00 at 02.5s. Total sales: $11.00
+```
+
+. . .
+
+Latest is sometimes good enough, but we care about total sales!
+
+::: {.notes}
+ - full story in the last line: we got the latest message, promptly, but it meant we missed the $4 sale
+:::
+
+## Solution 3: Conflater Interface
+
+ - What if we could **conflate** messages, so two messages sent by the producer become one message
+ sent to the consumer, *while still carrying all the information the consumer cares about?*
+
+. . .
+
+```{.go code-line-numbers="1,2,4"}
+type Conflater[C any] interface {
+	ConflateWith(latest C) C
+	ZeroValue() C
+}
+```
+
+. . .
+
+```{.go code-line-numbers="1-6"}
+func (s Sale) ConflateWith(s2 Sale) Sale {
+	return Sale{
+		dollars:   s.dollars + s2.dollars,
+		timestamp: maxTime(s.timestamp, s2.timestamp),
+	}
+}
+
+func (s Sale) ZeroValue() Sale {
+	return Sale{}
+}
+```
+
+## Solution 3: Conflater
+
+```{.go code-line-numbers="|11,20,21"}
+func ConflateV3[T Conflater[T]](retryInterval time.Duration) (chan<- T, <-chan T) {
+	outCh := make(chan T)
+	inCh := make(chan T)
+	go func() {
+		var conflatedMessage T
+		var retryTimer *time.Timer
+		var retryCh <-chan time.Time
+		for {
+			select {
+			case lastMsg := <-inCh:
+				conflatedMessage = conflatedMessage.ConflateWith(lastMsg)
+				if retryTimer != nil {
+					retryTimer.Stop()
+					retryCh = nil
+				}
+			case <-retryCh:
+			}
+
+			select {
+			case outCh <- conflatedMessage:
+				conflatedMessage = T.ZeroValue(conflatedMessage)
+			default:
+				retryTimer = time.NewTimer(retryInterval)
+				retryCh = retryTimer.C
+			}
+		}
+	}()
+	return inCh, outCh
+}
+```
+
+::: {.notes}
+ - there are only a few changes: we conflate the most recently received message with the existing conflated message,
+ and zero-out the conflate message state after sending it
+:::
+
+## Grading Solution 3
+
+- ✅ - Every message received by the consumer 
+    - Has the latest data
+    - Reflects all sent data
+- ❌ ...
+
+. . .
+
+```{.log code-line-numbers="|3,5,8,10|1,2,4,6,7,10|10"}
+00.5s | Made sale: $1.00 at 00.5s
+01.0s | Made sale: $2.00 at 01.0s
+01.2s | Sale received after 1ms: $1.00 at 00.5s. Total sales: $1.00
+01.5s | Made sale: $3.00 at 01.5s
+01.9s | Sale received after 202ms: $2.00 at 01.0s. Total sales: $3.00
+02.0s | Made sale: $4.00 at 02.0s
+02.5s | Made sale: $5.00 at 02.5s
+02.6s | Sale received after 403ms: $3.00 at 01.5s. Total sales: $6.00
+03.0s | Made sale: $6.00 at 03.0s
+03.3s | Sale received after 103ms: $9.00 at 02.5s. Total sales: $15.00
+```
+
+. . . 
+
+Concurrency Nirvana? Or...
+
+::: {.notes}
+ - we've only received 4 sale messages!
+ - but 5 sales are included
+ - the last sale we received ($9) is a conflating of the $4 and $5 sales
+:::
+
+## Solutions 4, 5, ...
+
+::: {.incremental}
+ - What about shutdown?
+   - Propagating the closed channel?
+   - Stopping the running goroutine?
+ - These are solvable problems... *left as an exercise for the reader*
+:::
+
+## Reflecting on the Conflater pattern
+
+::: {.incremental}
+ - It's nice decoupling *in theory*, especially with generics
+ - It's a leaky abstraction
+   - "Retry interval?  What's that?"
+   - "Why do I need to cancel my channel?"
+ - I wouldn't recommend it *highly* in production code 
+ - I found a bug in my production code while writing this talk 🙈
+ - But... goroutines and channels are fun!
+ - If you're interested in more of these sorts of shenningans, I recommend *Concurrency in Go* by Katherine Cox-Buday
+:::
+
+## Thanks For Listening!
+:::: {.columns}
+::: {.column width="40%"}
+![](concurrency_in_go.png)
+:::
+
+::: {.column width="60%"}
+![](qrcode.png)
+
+ - github.com/pgwhalen/conflate-talk/
+ - pgwhalen.com/conflate-talk
+:::
+::::
